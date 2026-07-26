@@ -5,7 +5,7 @@ A high-performance GUI application designed to optimize CNC G-Code cutting/trave
 ![Python](https://img.shields.io/badge/Python-3.8%2B-blue)
 ![C++](https://img.shields.io/badge/C%2B%2B-17-00599C)
 ![PyQt5](https://img.shields.io/badge/GUI-PyQt5-green)
-![License](https://img.shields.io/badge/License-MIT-brightgreen)
+![License](https://img.shields.io/badge/License-GPLv3-brightgreen)
 
 ---
 
