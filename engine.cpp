@@ -25,8 +25,22 @@ struct Point {
 
 struct Contour {
     std::vector<Point> points;
-    Point startPoint() const { return points.front(); }
-    Point endPoint() const { return points.back(); }
+    int regionId = -1;
+    bool isMicroPad = false;
+    double area = 0.0;
+    Point centroid{0.0, 0.0, 0.0, 0};
+
+    Point startPoint(bool flipped = false) const { 
+        return flipped ? points.back() : points.front(); 
+    }
+    Point endPoint(bool flipped = false) const { 
+        return flipped ? points.front() : points.back(); 
+    }
+};
+
+struct Gene {
+    int contourIdx;
+    bool isFlipped = false;
 };
 
 struct OptimizationReport {
@@ -52,6 +66,13 @@ struct GAConfig {
     int popSize = 50;
     int generations = 200;
     double mutationRate = 0.15;
+    
+    // Configs khusus Algoritma 5 (PCB-Aware)
+    bool enableThermalPenalty = true;
+    int regionStrategy = 0; // 0: Disabled, 1: Smallest First, 2: Largest First, 3: Center-Out
+    double thermalRadius = 2.0; // mm
+    double maxFeedrateG0 = 3000.0; // mm/min
+    double acceleration = 500.0; // mm/s^2
 };
 
 // --- MAIN OPTIMIZER ENGINE CLASS ---
@@ -62,8 +83,8 @@ private:
     std::vector<Point> optimizedPoints;
     std::vector<Contour> contours;
     Point startPosition{0.0, 0.0, 0.0, 0};
+    Point globalCentroid{0.0, 0.0, 0.0, 0};
 
-    // Algorithm Configurations
     Opt2Config opt2Config;
     SAConfig saConfig;
     GAConfig gaConfig;
@@ -81,7 +102,21 @@ private:
         return std::hypot(a.x - b.x, a.y - b.y);
     }
 
-    void extractContours() {
+    // Kinematika realistis memperhitungkan Akselerasi GRBL Sculpfun
+    double calculateKinematicTime(double distance) {
+        if (distance <= 0.0001) return 0.0;
+        double vMax = gaConfig.maxFeedrateG0 / 60.0; // mm/s
+        double a = gaConfig.acceleration; // mm/s^2
+        
+        double dAccel = (vMax * vMax) / a;
+        if (distance < dAccel) {
+            return 2.0 * std::sqrt(distance / a);
+        } else {
+            return (vMax / a) + ((distance - dAccel) / vMax);
+        }
+    }
+
+    void extractAndAnalyzeContours() {
         contours.clear();
         Contour currentContour;
 
@@ -101,21 +136,71 @@ private:
         if (!currentContour.points.empty()) {
             contours.push_back(currentContour);
         }
+
+        if (contours.empty()) return;
+
+        // Analisa Geometri & Spatial Clustering (Centroid & Bounding Box)
+        double sumX = 0.0, sumY = 0.0;
+        int totalPts = 0;
+
+        for (auto& cnt : contours) {
+            double minX = std::numeric_limits<double>::max(), maxX = std::numeric_limits<double>::lowest();
+            double minY = std::numeric_limits<double>::max(), maxY = std::numeric_limits<double>::lowest();
+            double cX = 0.0, cY = 0.0;
+
+            for (const auto& pt : cnt.points) {
+                minX = std::min(minX, pt.x); maxX = std::max(maxX, pt.x);
+                minY = std::min(minY, pt.y); maxY = std::max(maxY, pt.y);
+                cX += pt.x; cY += pt.y;
+                sumX += pt.x; sumY += pt.y;
+                totalPts++;
+            }
+
+            double w = maxX - minX;
+            double h = maxY - minY;
+            cnt.area = w * h;
+            cnt.centroid = {cX / cnt.points.size(), cY / cnt.points.size(), 0.0, 0};
+            
+            // Deteksi Micro-Pad (QFP) berdasarkan bounding box
+            if (std::hypot(w, h) < 3.0) {
+                cnt.isMicroPad = true;
+            }
+        }
+
+        globalCentroid = {sumX / totalPts, sumY / totalPts, 0.0, 0};
+
+        // Clustering Region berbasis Jarak Centroid (< 3.0 mm)
+        int currentRegionId = 0;
+        for (size_t i = 0; i < contours.size(); ++i) {
+            if (contours[i].regionId != -1) continue;
+            contours[i].regionId = currentRegionId;
+
+            for (size_t j = i + 1; j < contours.size(); ++j) {
+                if (contours[j].regionId == -1 && 
+                    euclideanDistance(contours[i].centroid, contours[j].centroid) < 3.0) {
+                    contours[j].regionId = currentRegionId;
+                }
+            }
+            currentRegionId++;
+        }
     }
 
-    std::vector<Point> rebuildPathFromContours(const std::vector<Contour>& orderedContours) {
+    std::vector<Point> rebuildPathFromGenes(const std::vector<Gene>& genes) {
         std::vector<Point> path;
         Point currentPos = startPosition;
 
-        for (const auto& cnt : orderedContours) {
-            Point travelTarget = cnt.startPoint();
-            travelTarget.type = 0; // Rapid travel (G00) to contour start
+        for (const auto& g : genes) {
+            const auto& cnt = contours[g.contourIdx];
+            Point travelTarget = cnt.startPoint(g.isFlipped);
+            travelTarget.type = 0; // Rapid travel G00
             path.push_back(travelTarget);
 
-            for (const auto& pt : cnt.points) {
-                path.push_back(pt);
+            if (!g.isFlipped) {
+                for (const auto& pt : cnt.points) path.push_back(pt);
+            } else {
+                for (auto it = cnt.points.rbegin(); it != cnt.points.rend(); ++it) path.push_back(*it);
             }
-            currentPos = cnt.endPoint();
+            currentPos = cnt.endPoint(g.isFlipped);
         }
         return path;
     }
@@ -130,9 +215,7 @@ private:
         return dist;
     }
 
-    // --- ALGORITHM IMPLEMENTATIONS ---
-
-    // 1. Nearest Neighbor (Greedy)
+    // --- ALGORITHMS 1 - 3 (STANDARD TSP) ---
     std::vector<Contour> solveNearestNeighbor() {
         std::vector<Contour> result;
         std::vector<bool> visited(contours.size(), false);
@@ -151,7 +234,6 @@ private:
                     }
                 }
             }
-
             if (bestIdx != -1) {
                 visited[bestIdx] = true;
                 result.push_back(contours[bestIdx]);
@@ -161,7 +243,6 @@ private:
         return result;
     }
 
-    // 2. 2-Opt Local Search
     std::vector<Contour> solve2Opt() {
         std::vector<Contour> tour = solveNearestNeighbor();
         if (tour.size() <= 2) return tour;
@@ -173,12 +254,10 @@ private:
         while (improved && iterCount < opt2Config.maxIterations) {
             improved = false;
             iterCount++;
-
             for (size_t i = 0; i < tour.size() - 1; ++i) {
                 for (size_t j = i + 1; j < tour.size(); ++j) {
                     std::vector<Contour> newTour = tour;
                     std::reverse(newTour.begin() + i, newTour.begin() + j + 1);
-
                     double newDistance = calculateTotalTravelDistance(newTour);
                     if (newDistance < bestDistance) {
                         bestDistance = newDistance;
@@ -191,13 +270,11 @@ private:
         return tour;
     }
 
-    // 3. Simulated Annealing (SA)
     std::vector<Contour> solveSimulatedAnnealing() {
         std::vector<Contour> currentTour = solveNearestNeighbor();
         if (currentTour.size() <= 2) return currentTour;
 
         std::vector<Contour> bestTour = currentTour;
-
         double currentCost = calculateTotalTravelDistance(currentTour);
         double bestCost = currentCost;
 
@@ -221,7 +298,6 @@ private:
             if (delta < 0 || std::exp(-delta / temp) > ((double)rand() / RAND_MAX)) {
                 currentTour = newTour;
                 currentCost = newCost;
-
                 if (currentCost < bestCost) {
                     bestTour = currentTour;
                     bestCost = currentCost;
@@ -232,7 +308,7 @@ private:
         return bestTour;
     }
 
-    // 4. Genetic Algorithm (GA)
+    // --- ALGORITHM 4: STANDARD GENERAL GA ---
     std::vector<Contour> solveGeneticAlgorithm() {
         if (contours.size() <= 2) return contours;
 
@@ -275,7 +351,7 @@ private:
 
             std::vector<Individual> newPopulation;
             newPopulation.reserve(popSize);
-            newPopulation.push_back(bestIndividual); // Elitism
+            newPopulation.push_back(bestIndividual);
 
             std::uniform_int_distribution<int> popDist(0, popSize - 1);
             auto selectParent = [&]() {
@@ -288,7 +364,6 @@ private:
                 Individual p1 = selectParent();
                 Individual p2 = selectParent();
 
-                // Order Crossover (OX)
                 std::uniform_int_distribution<int> cutDist(0, numContours - 1);
                 int c1 = cutDist(rng);
                 int c2 = cutDist(rng);
@@ -312,14 +387,12 @@ private:
                     }
                 }
 
-                // Swap Mutation
                 std::uniform_real_distribution<double> probDist(0.0, 1.0);
                 if (probDist(rng) < mutationRate) {
                     int m1 = cutDist(rng);
                     int m2 = cutDist(rng);
                     std::swap(child[m1], child[m2]);
                 }
-
                 newPopulation.push_back(child);
             }
             population = newPopulation;
@@ -327,33 +400,176 @@ private:
 
         std::vector<Contour> result;
         result.reserve(numContours);
-        for (int idx : bestIndividual) {
-            result.push_back(contours[idx]);
-        }
+        for (int idx : bestIndividual) result.push_back(contours[idx]);
         return result;
+    }
+
+    // --- ALGORITHM 5: DOMAIN-SPECIFIC PCB-AWARE GA ---
+    std::vector<Point> solvePcbAwareGA() {
+        if (contours.size() <= 2) return rawPoints;
+
+        const int popSize = gaConfig.popSize;
+        const int generations = gaConfig.generations;
+        const double mutationRate = gaConfig.mutationRate;
+        const size_t numContours = contours.size();
+
+        std::default_random_engine rng(1337);
+        using Individual = std::vector<Gene>;
+        std::vector<Individual> population(popSize);
+
+        Individual baseInd(numContours);
+        for (size_t i = 0; i < numContours; ++i) {
+            baseInd[i] = {static_cast<int>(i), false};
+        }
+
+        for (int i = 0; i < popSize; ++i) {
+            population[i] = baseInd;
+            if (i > 0) std::shuffle(population[i].begin(), population[i].end(), rng);
+        }
+
+        // PCB-Aware Fitness Evaluator
+        auto evalFitness = [&](const Individual& ind) {
+            double totalCost = 0.0;
+            Point currentPos = startPosition;
+
+            for (size_t i = 0; i < ind.size(); ++i) {
+                const auto& geneCurr = ind[i];
+                const auto& cntCurr = contours[geneCurr.contourIdx];
+
+                // 1. Kinematic G0 Travel Cost
+                double dist = euclideanDistance(currentPos, cntCurr.startPoint(geneCurr.isFlipped));
+                totalCost += calculateKinematicTime(dist) * 100.0; // Scaled time cost
+
+                // 2. Thermal Penalty (QFP Spacing)
+                if (gaConfig.enableThermalPenalty && i > 0) {
+                    const auto& genePrev = ind[i - 1];
+                    const auto& cntPrev = contours[genePrev.contourIdx];
+
+                    if (cntCurr.isMicroPad && cntPrev.isMicroPad) {
+                        double centerDist = euclideanDistance(cntCurr.centroid, cntPrev.centroid);
+                        if (centerDist < gaConfig.thermalRadius) {
+                            totalCost += 500.0 * (1.0 - (centerDist / gaConfig.thermalRadius));
+                        }
+                    }
+                }
+
+                // 3. Region Strategy Penalty
+                if (gaConfig.regionStrategy != 0 && i > 0) {
+                    const auto& genePrev = ind[i - 1];
+                    const auto& cntPrev = contours[genePrev.contourIdx];
+
+                    if (gaConfig.regionStrategy == 1) { // Smallest First
+                        if (cntCurr.area < cntPrev.area && cntPrev.regionId != cntCurr.regionId) {
+                            totalCost += 300.0;
+                        }
+                    } else if (gaConfig.regionStrategy == 2) { // Largest First
+                        if (cntCurr.area > cntPrev.area && cntPrev.regionId != cntCurr.regionId) {
+                            totalCost += 300.0;
+                        }
+                    } else if (gaConfig.regionStrategy == 3) { // Center-Out (Centroid)
+                        double distCurrCenter = euclideanDistance(cntCurr.centroid, globalCentroid);
+                        double distPrevCenter = euclideanDistance(cntPrev.centroid, globalCentroid);
+                        if (distCurrCenter < distPrevCenter && cntPrev.regionId != cntCurr.regionId) {
+                            totalCost += 300.0;
+                        }
+                    }
+                }
+
+                currentPos = cntCurr.endPoint(geneCurr.isFlipped);
+            }
+            return totalCost;
+        };
+
+        Individual bestIndividual = population[0];
+        double bestCost = evalFitness(bestIndividual);
+
+        for (int gen = 0; gen < generations; ++gen) {
+            std::vector<double> costs(popSize);
+            for (int i = 0; i < popSize; ++i) {
+                costs[i] = evalFitness(population[i]);
+                if (costs[i] < bestCost) {
+                    bestCost = costs[i];
+                    bestIndividual = population[i];
+                }
+            }
+
+            std::vector<Individual> newPopulation;
+            newPopulation.reserve(popSize);
+            newPopulation.push_back(bestIndividual);
+
+            std::uniform_int_distribution<int> popDist(0, popSize - 1);
+            auto selectParent = [&]() {
+                int i1 = popDist(rng); int i2 = popDist(rng);
+                return (costs[i1] < costs[i2]) ? population[i1] : population[i2];
+            };
+
+            while (newPopulation.size() < static_cast<size_t>(popSize)) {
+                Individual p1 = selectParent();
+                Individual p2 = selectParent();
+
+                std::uniform_int_distribution<int> cutDist(0, numContours - 1);
+                int c1 = cutDist(rng); int c2 = cutDist(rng);
+                if (c1 > c2) std::swap(c1, c2);
+
+                Individual child(numContours);
+                std::vector<bool> inChild(numContours, false);
+
+                for (int i = c1; i <= c2; ++i) {
+                    child[i] = p1[i];
+                    inChild[p1[i].contourIdx] = true;
+                }
+
+                int childIdx = (c2 + 1) % numContours;
+                for (size_t i = 0; i < numContours; ++i) {
+                    int p2Idx = (c2 + 1 + i) % numContours;
+                    const auto& geneP2 = p2[p2Idx];
+                    if (!inChild[geneP2.contourIdx]) {
+                        child[childIdx] = geneP2;
+                        childIdx = (childIdx + 1) % numContours;
+                    }
+                }
+
+                // Dual-Mode Mutation (Swap or Flip)
+                std::uniform_real_distribution<double> probDist(0.0, 1.0);
+                if (probDist(rng) < mutationRate) {
+                    int m1 = cutDist(rng);
+                    int m2 = cutDist(rng);
+                    if (probDist(rng) < 0.5) {
+                        std::swap(child[m1], child[m2]); // Swap Order
+                    } else {
+                        child[m1].isFlipped = !child[m1].isFlipped; // Flip Orientation
+                    }
+                }
+                newPopulation.push_back(child);
+            }
+            population = newPopulation;
+        }
+
+        return rebuildPathFromGenes(bestIndividual);
     }
 
 public:
     GCodeOptimizer() {}
 
-    // --- CONFIGURATION SETTERS ---
-    void set2OptConfig(int maxIter) {
-        opt2Config.maxIterations = maxIter;
-    }
-
+    void set2OptConfig(int maxIter) { opt2Config.maxIterations = maxIter; }
     void setSAConfig(double initialTemp, double coolingRate, double minTemp) {
         saConfig.initialTemp = initialTemp;
         saConfig.coolingRate = coolingRate;
         saConfig.minTemp = minTemp;
     }
-
-    void setGAConfig(int popSize, int generations, double mutationRate) {
+    void setGAConfig(int popSize, int generations, double mutationRate, 
+                     bool enableThermal, int regionStrat, double thermalRad, 
+                     double maxG0, double accel) {
         gaConfig.popSize = popSize;
         gaConfig.generations = generations;
         gaConfig.mutationRate = mutationRate;
+        gaConfig.enableThermalPenalty = enableThermal;
+        gaConfig.regionStrategy = regionStrat;
+        gaConfig.thermalRadius = thermalRad;
+        gaConfig.maxFeedrateG0 = maxG0;
+        gaConfig.acceleration = accel;
     }
 
-    // --- MULTI-FORMAT FILE PARSER ---
     void loadGCode(const std::string& filepath) {
         rawPoints.clear();
         std::ifstream file(filepath);
@@ -364,13 +580,10 @@ public:
         std::string currentModal = "G01";
 
         while (std::getline(file, line)) {
-            // Pembersihan Komentar Kompatibilitas Multi-Format: (), ;, dan []
             size_t commentPos = line.find('(');
             if (commentPos != std::string::npos) line = line.substr(0, commentPos);
-            
             commentPos = line.find(';');
             if (commentPos != std::string::npos) line = line.substr(0, commentPos);
-
             commentPos = line.find('[');
             if (commentPos != std::string::npos) line = line.substr(0, commentPos);
 
@@ -410,7 +623,7 @@ public:
             }
         }
         file.close();
-        extractContours();
+        extractAndAnalyzeContours();
         optimizedPoints = rawPoints;
     }
 
@@ -419,6 +632,11 @@ public:
     std::vector<Point> optimizePath(int method_type) {
         if (contours.empty()) return rawPoints;
 
+        if (method_type == 4) {
+            optimizedPoints = solvePcbAwareGA();
+            return optimizedPoints;
+        }
+
         std::vector<Contour> orderedContours;
         if (method_type == 0) orderedContours = solveNearestNeighbor();
         else if (method_type == 1) orderedContours = solve2Opt();
@@ -426,36 +644,38 @@ public:
         else if (method_type == 3) orderedContours = solveGeneticAlgorithm();
         else return rawPoints;
 
-        optimizedPoints = rebuildPathFromContours(orderedContours);
+        std::vector<Gene> genes;
+        for (size_t i = 0; i < orderedContours.size(); ++i) {
+            int origIdx = 0;
+            for (size_t j = 0; j < contours.size(); ++j) {
+                if (&contours[j] == &orderedContours[i]) { origIdx = j; break; }
+            }
+            genes.push_back({origIdx, false});
+        }
+
+        optimizedPoints = rebuildPathFromGenes(genes);
         return optimizedPoints;
     }
 
-    // --- EXECUTION BENCHMARKING & REPORTING ---
     OptimizationReport runWithReport(int method_type) {
         OptimizationReport report;
         report.contourCount = static_cast<int>(contours.size());
         report.originalDistance = calculateTotalTravelDistance(contours);
 
         auto start = std::chrono::high_resolution_clock::now();
-        
         optimizePath(method_type);
-
         auto end = std::chrono::high_resolution_clock::now();
-        std::chrono::duration<double, std::milli> duration = end - start;
 
+        std::chrono::duration<double, std::milli> duration = end - start;
         report.timeTakenMs = duration.count();
 
-        // Hitung total jarak Rapid Travel (G00) akhir
         double finalDist = 0.0;
         Point pos = startPosition;
         for (const auto& pt : optimizedPoints) {
-            if (pt.type == 0) {
-                finalDist += euclideanDistance(pos, pt);
-            }
+            if (pt.type == 0) finalDist += euclideanDistance(pos, pt);
             pos = pt;
         }
         report.optimizedDistance = finalDist;
-
         return report;
     }
 };
