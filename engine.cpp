@@ -20,22 +20,22 @@ struct Point {
     double x = 0.0;
     double y = 0.0;
     double z = 0.0;
-    int type = 1; // 0: Travel (G00), 1: Cutting (G01)
+    int type = 1;     // 0: Travel (G00), 1: Cutting (G01)
+    int m = -1;       // State Modal (misal: 3 untuk M3, 4 untuk M4)
+    double s = -1.0;  // Spindle/Laser Power
+    double f = -1.0;  // Feedrate
 };
 
 struct Contour {
+    int id = -1; // ID statis
     std::vector<Point> points;
     int regionId = -1;
     bool isMicroPad = false;
     double area = 0.0;
     Point centroid{0.0, 0.0, 0.0, 0};
 
-    Point startPoint(bool flipped = false) const { 
-        return flipped ? points.back() : points.front(); 
-    }
-    Point endPoint(bool flipped = false) const { 
-        return flipped ? points.front() : points.back(); 
-    }
+    Point startPoint(bool flipped = false) const { return flipped ? points.back() : points.front(); }
+    Point endPoint(bool flipped = false) const { return flipped ? points.front() : points.back(); }
 };
 
 struct Gene {
@@ -183,27 +183,33 @@ private:
             }
             currentRegionId++;
         }
+
+        for (size_t i = 0; i < contours.size(); ++i) {
+            contours[i].id = static_cast<int>(i);
+        }
     }
 
     std::vector<Point> rebuildPathFromGenes(const std::vector<Gene>& genes) {
-        std::vector<Point> path;
-        Point currentPos = startPosition;
+    std::vector<Point> path;
+    Point currentPos = startPosition;
 
-        for (const auto& g : genes) {
-            const auto& cnt = contours[g.contourIdx];
-            Point travelTarget = cnt.startPoint(g.isFlipped);
-            travelTarget.type = 0; // Rapid travel G00
-            path.push_back(travelTarget);
+    for (const auto& g : genes) {
+        const auto& cnt = contours[g.contourIdx];
+        Point travelTarget = cnt.startPoint(g.isFlipped);
+        travelTarget.type = 0; 
+        path.push_back(travelTarget);
 
-            if (!g.isFlipped) {
-                for (const auto& pt : cnt.points) path.push_back(pt);
-            } else {
-                for (auto it = cnt.points.rbegin(); it != cnt.points.rend(); ++it) path.push_back(*it);
+        if (!g.isFlipped) {
+            for (auto pt : cnt.points) { pt.type = 1; path.push_back(pt); }
+        } else {
+            for (auto it = cnt.points.rbegin(); it != cnt.points.rend(); ++it) {
+                Point pt = *it; pt.type = 1; path.push_back(pt);
             }
-            currentPos = cnt.endPoint(g.isFlipped);
         }
-        return path;
+        currentPos = cnt.endPoint(g.isFlipped);
     }
+    return path;
+}
 
     double calculateTotalTravelDistance(const std::vector<Contour>& t) {
         double dist = 0.0;
@@ -417,17 +423,22 @@ private:
         using Individual = std::vector<Gene>;
         std::vector<Individual> population(popSize);
 
-        Individual baseInd(numContours);
-        for (size_t i = 0; i < numContours; ++i) {
-            baseInd[i] = {static_cast<int>(i), false};
+        // 1. SEED INJECTION: Kromosom Alpha dari Nearest Neighbor
+        std::vector<Contour> nnTour = solveNearestNeighbor();
+        Individual alphaSeed(numContours);
+        for(size_t i = 0; i < numContours; ++i) {
+            alphaSeed[i] = {nnTour[i].id, false};
         }
+        population[0] = alphaSeed;
 
-        for (int i = 0; i < popSize; ++i) {
+        // Sisa populasi diacak
+        Individual baseInd = alphaSeed;
+        for (int i = 1; i < popSize; ++i) {
+            std::shuffle(baseInd.begin(), baseInd.end(), rng);
             population[i] = baseInd;
-            if (i > 0) std::shuffle(population[i].begin(), population[i].end(), rng);
         }
 
-        // PCB-Aware Fitness Evaluator
+        // 2. DINAMISASI FITNESS WEIGHTING (Multiplier Base)
         auto evalFitness = [&](const Individual& ind) {
             double totalCost = 0.0;
             Point currentPos = startPosition;
@@ -436,45 +447,34 @@ private:
                 const auto& geneCurr = ind[i];
                 const auto& cntCurr = contours[geneCurr.contourIdx];
 
-                // 1. Kinematic G0 Travel Cost
                 double dist = euclideanDistance(currentPos, cntCurr.startPoint(geneCurr.isFlipped));
-                totalCost += calculateKinematicTime(dist) * 100.0; // Scaled time cost
+                double penaltyMult = 1.0; // Base pengali 1x (jarak asli)
 
-                // 2. Thermal Penalty (QFP Spacing)
+                // Thermal Penalty (Max +200% jarak)
                 if (gaConfig.enableThermalPenalty && i > 0) {
-                    const auto& genePrev = ind[i - 1];
-                    const auto& cntPrev = contours[genePrev.contourIdx];
-
+                    const auto& cntPrev = contours[ind[i - 1].contourIdx];
                     if (cntCurr.isMicroPad && cntPrev.isMicroPad) {
                         double centerDist = euclideanDistance(cntCurr.centroid, cntPrev.centroid);
                         if (centerDist < gaConfig.thermalRadius) {
-                            totalCost += 500.0 * (1.0 - (centerDist / gaConfig.thermalRadius));
+                            penaltyMult += 2.0 * (1.0 - (centerDist / gaConfig.thermalRadius));
                         }
                     }
                 }
 
-                // 3. Region Strategy Penalty
+                // Region Strategy Penalty (+150% jarak jika melanggar urutan region)
                 if (gaConfig.regionStrategy != 0 && i > 0) {
-                    const auto& genePrev = ind[i - 1];
-                    const auto& cntPrev = contours[genePrev.contourIdx];
-
-                    if (gaConfig.regionStrategy == 1) { // Smallest First
-                        if (cntCurr.area < cntPrev.area && cntPrev.regionId != cntCurr.regionId) {
-                            totalCost += 300.0;
-                        }
-                    } else if (gaConfig.regionStrategy == 2) { // Largest First
-                        if (cntCurr.area > cntPrev.area && cntPrev.regionId != cntCurr.regionId) {
-                            totalCost += 300.0;
-                        }
-                    } else if (gaConfig.regionStrategy == 3) { // Center-Out (Centroid)
-                        double distCurrCenter = euclideanDistance(cntCurr.centroid, globalCentroid);
-                        double distPrevCenter = euclideanDistance(cntPrev.centroid, globalCentroid);
-                        if (distCurrCenter < distPrevCenter && cntPrev.regionId != cntCurr.regionId) {
-                            totalCost += 300.0;
+                    const auto& cntPrev = contours[ind[i - 1].contourIdx];
+                    if (cntPrev.regionId != cntCurr.regionId) {
+                        if (gaConfig.regionStrategy == 1 && cntCurr.area < cntPrev.area) penaltyMult += 1.5;
+                        else if (gaConfig.regionStrategy == 2 && cntCurr.area > cntPrev.area) penaltyMult += 1.5;
+                        else if (gaConfig.regionStrategy == 3 && 
+                            euclideanDistance(cntCurr.centroid, globalCentroid) < euclideanDistance(cntPrev.centroid, globalCentroid)) {
+                            penaltyMult += 1.5;
                         }
                     }
                 }
 
+                totalCost += (dist * penaltyMult);
                 currentPos = cntCurr.endPoint(geneCurr.isFlipped);
             }
             return totalCost;
@@ -495,7 +495,7 @@ private:
 
             std::vector<Individual> newPopulation;
             newPopulation.reserve(popSize);
-            newPopulation.push_back(bestIndividual);
+            newPopulation.push_back(bestIndividual); // Elitism
 
             std::uniform_int_distribution<int> popDist(0, popSize - 1);
             auto selectParent = [&]() {
@@ -529,15 +529,15 @@ private:
                     }
                 }
 
-                // Dual-Mode Mutation (Swap or Flip)
+                // Dual-Mode Mutation
                 std::uniform_real_distribution<double> probDist(0.0, 1.0);
                 if (probDist(rng) < mutationRate) {
                     int m1 = cutDist(rng);
                     int m2 = cutDist(rng);
                     if (probDist(rng) < 0.5) {
-                        std::swap(child[m1], child[m2]); // Swap Order
+                        std::swap(child[m1], child[m2]); 
                     } else {
-                        child[m1].isFlipped = !child[m1].isFlipped; // Flip Orientation
+                        child[m1].isFlipped = !child[m1].isFlipped; 
                     }
                 }
                 newPopulation.push_back(child);
@@ -577,6 +577,8 @@ public:
 
         std::string line;
         double curX = 0.0, curY = 0.0, curZ = 0.0;
+        int curM = -1;
+        double curS = -1.0, curF = -1.0;
         std::string currentModal = "G01";
 
         while (std::getline(file, line)) {
@@ -592,6 +594,8 @@ public:
             std::stringstream ss(line);
             std::string token;
             double targetX = curX, targetY = curY, targetZ = curZ;
+            int targetM = curM;
+            double targetS = curS, targetF = curF;
             bool hasX = false, hasY = false, hasZ = false;
             std::string command = "";
 
@@ -611,6 +615,12 @@ public:
                 else if (prefix == 'X') { hasX = safeStod(valStr, targetX); }
                 else if (prefix == 'Y') { hasY = safeStod(valStr, targetY); }
                 else if (prefix == 'Z') { hasZ = safeStod(valStr, targetZ); }
+                else if (prefix == 'M') { 
+                    double mVal; 
+                    if(safeStod(valStr, mVal)) targetM = static_cast<int>(mVal); 
+                }
+                else if (prefix == 'S') { safeStod(valStr, targetS); }
+                else if (prefix == 'F') { safeStod(valStr, targetF); }
             }
 
             if (command.empty() && (hasX || hasY || hasZ)) command = currentModal;
@@ -618,8 +628,9 @@ public:
 
             if (hasX || hasY || hasZ) {
                 int type = (command == "G00") ? 0 : 1;
-                rawPoints.push_back({targetX, targetY, targetZ, type});
+                rawPoints.push_back({targetX, targetY, targetZ, type, targetM, targetS, targetF});
                 curX = targetX; curY = targetY; curZ = targetZ;
+                curM = targetM; curS = targetS; curF = targetF;
             }
         }
         file.close();
@@ -630,32 +641,27 @@ public:
     std::vector<Point> getRawPoints() { return rawPoints; }
 
     std::vector<Point> optimizePath(int method_type) {
-        if (contours.empty()) return rawPoints;
-
-        if (method_type == 4) {
-            optimizedPoints = solvePcbAwareGA();
-            return optimizedPoints;
-        }
-
-        std::vector<Contour> orderedContours;
-        if (method_type == 0) orderedContours = solveNearestNeighbor();
-        else if (method_type == 1) orderedContours = solve2Opt();
-        else if (method_type == 2) orderedContours = solveSimulatedAnnealing();
-        else if (method_type == 3) orderedContours = solveGeneticAlgorithm();
-        else return rawPoints;
-
-        std::vector<Gene> genes;
-        for (size_t i = 0; i < orderedContours.size(); ++i) {
-            int origIdx = 0;
-            for (size_t j = 0; j < contours.size(); ++j) {
-                if (&contours[j] == &orderedContours[i]) { origIdx = j; break; }
-            }
-            genes.push_back({origIdx, false});
-        }
-
-        optimizedPoints = rebuildPathFromGenes(genes);
+    if (contours.empty()) return rawPoints;
+    if (method_type == 4) {
+        optimizedPoints = solvePcbAwareGA();
         return optimizedPoints;
     }
+
+    std::vector<Contour> orderedContours;
+    if (method_type == 0) orderedContours = solveNearestNeighbor();
+    else if (method_type == 1) orderedContours = solve2Opt();
+    else if (method_type == 2) orderedContours = solveSimulatedAnnealing();
+    else if (method_type == 3) orderedContours = solveGeneticAlgorithm();
+    else return rawPoints;
+
+    std::vector<Gene> genes;
+    for (const auto& oc : orderedContours) {
+        genes.push_back({oc.id, false}); // Langsung mapping dari ID asli
+    }
+
+    optimizedPoints = rebuildPathFromGenes(genes);
+    return optimizedPoints;
+}
 
     OptimizationReport runWithReport(int method_type) {
         OptimizationReport report;
@@ -687,7 +693,10 @@ PYBIND11_MODULE(gcode_engine, m) {
         .def_readwrite("x", &Point::x)
         .def_readwrite("y", &Point::y)
         .def_readwrite("z", &Point::z)
-        .def_readwrite("type", &Point::type);
+        .def_readwrite("type", &Point::type)
+        .def_readwrite("m", &Point::m)
+        .def_readwrite("s", &Point::s)
+        .def_readwrite("f", &Point::f);
 
     py::class_<OptimizationReport>(m, "OptimizationReport")
         .def_readwrite("originalDistance", &OptimizationReport::originalDistance)
