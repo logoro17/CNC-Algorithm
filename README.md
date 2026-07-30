@@ -37,10 +37,11 @@ This project solves Traveling Salesperson Problem (TSP) variants for grouped G-C
 ## ⚙️ Project Architecture
 
 ```text
-├── gcode_engine/           # C++ Core Core Engine & Pybind11 Wrappers
-│   ├── src/                # G-Code Parser, Path Logic & Optimization Algorithms
-│   └── bindings.cpp        # Python C++ Extension Binding
+│
 ├── main.py                 # PyQt5 Application Main Entrypoint
-├── cnc2.gcode              # Sample Input G-Code File
+├── engine.cpp 		    # C++ backend Algorithm 
+├── .gcode             	    # Sample Input G-Code File
+├── .so 		    # C++ Algorithm Engine 
+├── compiler.sh 	    # C++ compiler command
 ├── README.md               # Project Documentation
 └── requirements.txt        # Python Dependencies

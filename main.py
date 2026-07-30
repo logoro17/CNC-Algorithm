@@ -157,12 +157,33 @@ class AlgorithmSettingsDialog(QDialog):
                 form_layout.addRow("Thermal Radius (mm):", self.spin_rad)
                 form_layout.addRow("Sculpfun G0 Limit:", self.spin_max_g0)
                 form_layout.addRow("Sculpfun Accel:", self.spin_accel)
+            
 
         layout.addLayout(form_layout)
         buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        if alg_index == 4:
+            self.btn_reset = QPushButton("reset")
+            self.btn_reset.setStyleSheet("color: red; font-weight: bold; padding: 2px 10px;")
+            buttons.addButton(self.btn_reset, QDialogButtonBox.ResetRole)
+            self.btn_reset.clicked.connect(self.reset_defaults)
+
         buttons.accepted.connect(self.accept)
         buttons.rejected.connect(self.reject)
         layout.addWidget(buttons)
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+    def reset_defaults(self):
+        if self.alg_index == 4:
+            self.spin_pop.setValue(50)
+            self.spin_gen.setValue(200)
+            self.spin_mut.setValue(0.15)
+            self.chk_thermal.setChecked(True)
+            self.combo_region.setCurrentIndex(3)
+            self.spin_rad.setValue(2.00)
+            self.spin_max_g0.setValue(3000)
+            self.spin_accel.setValue(500)
 
     def get_updated_params(self):
         if self.alg_index == 1:
@@ -365,6 +386,7 @@ class AutoLoadGCodeApp(QMainWindow):
 
         try:
             with open(file_path, 'w') as f:
+                alg_idx = self.combo_alg.currentIndex()
                 alg_name = self.combo_alg.currentText().strip()
                 f.write("(==================================================)\n")
                 f.write("(       OPTIMIZED BY PCB-AWARE ENGINE v2.0         )\n")
@@ -372,16 +394,27 @@ class AutoLoadGCodeApp(QMainWindow):
                 f.write("(==================================================)\n")
                 f.write("G21 (Units in mm)\n")
                 f.write("G90 (Absolute Positioning)\n")
-                f.write("M4 (Enable Dynamic Laser Mode for GRBL $32=1)\n")
-                f.write("F1000 (Cutting Feedrate mm/min)\n\n")
+                
+                # Jika bukan Algoritma 5, gunakan Hardcode M4 & F1000 lama
+                if alg_idx != 4:
+                    f.write("M4 (Enable Dynamic Laser Mode for GRBL $32=1)\n")
+                    f.write("F1000 (Cutting Feedrate mm/min)\n\n")
+                else:
+                    f.write("\n") 
 
                 for pt in self.last_optimized_points:
                     if pt.type == 0:
-                        # G00: Rapid Move (Otomatis mematikan laser pada mode M4)
                         f.write(f"G00 X{pt.x:.3f} Y{pt.y:.3f}\n")
                     else:
-                        # G01: Cutting Move (Otomatis menyalakan laser sesuai S-value jika diset)
-                        f.write(f"G01 X{pt.x:.3f} Y{pt.y:.3f}\n")
+                        if alg_idx == 4:
+                            # Khusus Algoritma 5: Tarik state memori C++ secara dinamis
+                            cmd = f"G01 X{pt.x:.3f} Y{pt.y:.3f}"
+                            if hasattr(pt, 'm') and pt.m != -1: cmd += f" M{pt.m}"
+                            if hasattr(pt, 's') and pt.s != -1.0: cmd += f" S{pt.s:.1f}"
+                            if hasattr(pt, 'f') and pt.f != -1.0: cmd += f" F{pt.f:.1f}"
+                            f.write(cmd + "\n")
+                        else:
+                            f.write(f"G01 X{pt.x:.3f} Y{pt.y:.3f}\n")
 
                 f.write("\nM5 (Force Laser OFF)\n")
                 f.write("G00 X0 Y0 (Return to Home)\n")
